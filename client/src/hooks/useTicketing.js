@@ -204,12 +204,15 @@ export function useTicketing() {
 
   const payAndConfirm = async () => {
     const pendingPayments = holds.filter((hold) => hold.phase === 'ready' || hold.phase === 'pending');
-    if (pendingPayments.length === 0) return;
+    if (pendingPayments.length === 0) {
+      return { confirmedUnits: [], pendingUnits: [], failures: [], allConfirmed: false };
+    }
 
     setBusy('payment');
     const confirmedUnits = [];
     const pendingUnits = [];
     const failures = [];
+    let allConfirmed = true;
     try {
       for (const hold of pendingPayments) {
         setHolds((current) => current.map((item) => (
@@ -225,11 +228,13 @@ export function useTicketing() {
             confirmedUnits.push(result.unit);
             setHolds((current) => current.filter((item) => item.bookingId !== hold.bookingId));
           } else if (result.status === 'PENDING') {
+            allConfirmed = false;
             pendingUnits.push(hold.unit);
             setHolds((current) => current.map((item) => (
               item.bookingId === hold.bookingId ? { ...item, phase: 'pending' } : item
             )));
           } else {
+            allConfirmed = false;
             pendingUnits.push(hold.unit);
             setHolds((current) => current.map((item) => (
               item.bookingId === hold.bookingId ? { ...item, phase: 'pending' } : item
@@ -239,14 +244,17 @@ export function useTicketing() {
         } catch (error) {
           const reason = error.payload?.reason;
           if (['PAYMENT_FAILED', 'EXPIRED', 'SOLD', 'NO_SESSION'].includes(reason)) {
+            allConfirmed = false;
             setHolds((current) => current.filter((item) => item.bookingId !== hold.bookingId));
           } else if (error.status === 0 || error.status >= 500) {
+            allConfirmed = false;
             pendingUnits.push(hold.unit);
             setHolds((current) => current.map((item) => (
               item.bookingId === hold.bookingId ? { ...item, phase: 'pending' } : item
             )));
             failures.push(`Unit ${hold.unit}: ${friendlyError(error)} Check payment status before retrying.`);
           } else {
+            allConfirmed = false;
             failures.push(`Unit ${hold.unit}: ${friendlyError(error)}`);
             setHolds((current) => current.map((item) => (
               item.bookingId === hold.bookingId ? { ...item, phase: 'ready' } : item
@@ -263,8 +271,15 @@ export function useTicketing() {
         const kind = failures.length > 0 ? 'error' : pendingUnits.length > 0 ? 'info' : 'success';
         setNotice({ kind, text: parts.join(' ') });
       }
+      return { confirmedUnits, pendingUnits, failures, allConfirmed };
     } catch (error) {
       showError(error);
+      return {
+        confirmedUnits,
+        pendingUnits,
+        failures: [...failures, friendlyError(error)],
+        allConfirmed: false
+      };
     } finally {
       setBusy('');
       void refreshInventory();

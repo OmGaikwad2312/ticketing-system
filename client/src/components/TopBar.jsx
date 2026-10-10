@@ -3,9 +3,9 @@ import { Moon, Sun, Ticket } from 'lucide-react';
 function TopBar({ holdCount, darkTheme, onToggleTheme }) {
   return (
     <header className="topbar">
-      <a className="wordmark" href="#top" aria-label="Ticketing home">
+      <a className="wordmark" href="#top" aria-label="Bastion home">
         <span className="mark"><Ticket size={15} strokeWidth={2.5} /></span>
-        <span>LIVE<span className="wordmark-divider"> / </span>INVENTORY</span>
+        <span>BASTION</span>
       </a>
       <nav className="topnav" aria-label="Main navigation">
         <a className="nav-link active" href="#inventory">Seat map</a>

@@ -5,6 +5,7 @@ import StatusBar from './components/StatusBar.jsx';
 import Toast from './components/Toast.jsx';
 import TopBar from './components/TopBar.jsx';
 import LandingPage from './components/LandingPage.jsx';
+import CheckoutPage from './components/CheckoutPage.jsx';
 import { useTicketing } from './hooks/useTicketing.js';
 import useTheme from './hooks/useTheme.js';
 
@@ -25,42 +26,64 @@ function BookingPage() {
   return (
     <main className="page-shell">
       <TopBar holdCount={ticketing.holds.length} darkTheme={darkTheme} onToggleTheme={toggleTheme} />
-      <EventPanel
-        counts={ticketing.counts}
-        holds={ticketing.holds}
-        inventory={ticketing.inventory}
-        nextExpiry={ticketing.nextExpiry}
-        now={ticketing.now}
-      />
-      <div className="content-grid">
-        <InventoryPanel
-          busy={ticketing.busy}
-          filter={ticketing.filter}
-          inventory={ticketing.inventory}
-          loading={ticketing.loading}
-          onFilterChange={ticketing.setFilter}
-          onQueryChange={ticketing.setQuery}
-          onRefresh={() => void ticketing.refreshInventory({ notify: true })}
-          onSelectSeat={ticketing.selectSeat}
-          ownHolds={ticketing.ownHolds}
-          pendingUnit={ticketing.pendingUnit}
-          query={ticketing.query}
-          seats={ticketing.seats}
-          visibleSeats={ticketing.visibleSeats}
-        />
-        <ReservationPanel
-          busy={ticketing.busy}
-          checkoutStep={ticketing.checkoutStep}
-          holds={ticketing.holds}
-          nextExpiry={ticketing.nextExpiry}
-          now={ticketing.now}
-          onBeginCheckout={() => void ticketing.beginCheckout()}
-          onPayAndConfirm={() => void ticketing.payAndConfirm()}
-          onRelease={ticketing.selectSeat}
-          onSetCheckoutStep={ticketing.setCheckoutStep}
-          readyCount={ticketing.readyCount}
-        />
-      </div>
+      {ticketing.checkoutStep ? (
+        <>
+          <EventPanel
+            counts={ticketing.counts}
+            holds={ticketing.holds}
+            inventory={ticketing.inventory}
+            nextExpiry={ticketing.nextExpiry}
+            now={ticketing.now}
+          />
+          <CheckoutPage
+            busy={ticketing.busy}
+            holds={ticketing.holds}
+            nextExpiry={ticketing.nextExpiry}
+            now={ticketing.now}
+            onBack={() => ticketing.setCheckoutStep(false)}
+            onPayAndConfirm={ticketing.payAndConfirm}
+          />
+        </>
+      ) : (
+        <>
+          <EventPanel
+            counts={ticketing.counts}
+            holds={ticketing.holds}
+            inventory={ticketing.inventory}
+            nextExpiry={ticketing.nextExpiry}
+            now={ticketing.now}
+          />
+          <div className="content-grid">
+            <InventoryPanel
+              busy={ticketing.busy}
+              filter={ticketing.filter}
+              inventory={ticketing.inventory}
+              loading={ticketing.loading}
+              onFilterChange={ticketing.setFilter}
+              onQueryChange={ticketing.setQuery}
+              onRefresh={() => void ticketing.refreshInventory({ notify: true })}
+              onSelectSeat={ticketing.selectSeat}
+              ownHolds={ticketing.ownHolds}
+              pendingUnit={ticketing.pendingUnit}
+              query={ticketing.query}
+              seats={ticketing.seats}
+              visibleSeats={ticketing.visibleSeats}
+            />
+            <ReservationPanel
+              busy={ticketing.busy}
+              checkoutStep={ticketing.checkoutStep}
+              holds={ticketing.holds}
+              nextExpiry={ticketing.nextExpiry}
+              now={ticketing.now}
+              onBeginCheckout={() => void ticketing.beginCheckout()}
+              onPayAndConfirm={() => void ticketing.payAndConfirm()}
+              onRelease={ticketing.selectSeat}
+              onSetCheckoutStep={ticketing.setCheckoutStep}
+              readyCount={ticketing.readyCount}
+            />
+          </div>
+        </>
+      )}
       <StatusBar
         counts={ticketing.counts}
         health={ticketing.health}

@@ -72,9 +72,9 @@ function LandingPage() {
   return (
     <main ref={pageRef} className="landing-page" data-theme={darkTheme ? 'dark' : 'light'}>
       <header className="landing-header">
-        <a className="landing-brand" href="/" aria-label="Flash Pass home">
+        <a className="landing-brand" href="/" aria-label="Bastion home">
           <span className="landing-brand-icon"><Ticket size={17} /></span>
-          <span>FLASH<span className="landing-brand-slash">//</span>PASS</span>
+          <span>BASTION</span>
         </a>
         <div className="landing-event-status">
           <span>LIVE EVENT</span>
@@ -107,7 +107,7 @@ function LandingPage() {
         </div>
 
         <div className="landing-hero-content">
-          <p className="landing-eyebrow">FLASH RESERVATION <span>/</span> LIVE EVENT</p>
+          <p className="landing-eyebrow">BASTION <span>/</span> LIVE EVENT</p>
           <h1 className="landing-title" id="landing-title">One seat.One Winner</h1>
           <p className="landing-subtitle">A fairer way into the room.</p>
           <p className="landing-copy">Join the queue, choose your view, and book without the rush.</p>
@@ -145,7 +145,7 @@ function LandingPage() {
           Start booking <ArrowRight size={15} />
         </a>
       </section>
-      <footer className="landing-footer">FLASH//PASS <span>Live inventory · Secure reservations</span></footer>
+      <footer className="landing-footer">BASTION <span>Live inventory · Secure reservations</span></footer>
     </main>
   );
 }
