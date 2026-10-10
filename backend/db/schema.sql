@@ -28,3 +28,7 @@ CREATE TABLE IF NOT EXISTS dead_letters (
 
 ALTER TABLE dead_letters ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'PENDING';
 ALTER TABLE dead_letters ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ;
+
+CREATE UNIQUE INDEX IF NOT EXISTS dead_letters_booking_id_unique
+  ON dead_letters ((payload->>'bookingId'))
+  WHERE payload ? 'bookingId';

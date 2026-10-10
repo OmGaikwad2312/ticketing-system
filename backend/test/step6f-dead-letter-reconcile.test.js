@@ -6,7 +6,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { config, redis, pool, cleanRedis } = require('./helpers');
-const persist = require('../worker/persist');
+const { deadLetter } = require('../src/services/deadLetter');
 
 describe('Step 6f: Dead-letter schema columns and automatic Redis/payment reconciliation', () => {
   beforeEach(async () => {
@@ -55,13 +55,15 @@ describe('Step 6f: Dead-letter schema columns and automatic Redis/payment reconc
     };
 
     try {
-      const outcome = await persist.writeToPostgres('1700000000000-0', {
-        bookingId: loserBookingId,
-        event: config.EVENT_ID,
-        unit: String(unit),
-        user: 'loser-user',
-      });
-      assert.equal(outcome, 'dead-lettered');
+      await deadLetter({
+        id: loserBookingId,
+        data: {
+          bookingId: loserBookingId,
+          eventId: config.EVENT_ID,
+          unit,
+          userId: 'loser-user',
+        },
+      }, new Error('SEAT_CONFLICT'), pool);
     } finally {
       console.error = origError;
     }
@@ -84,7 +86,7 @@ describe('Step 6f: Dead-letter schema columns and automatic Redis/payment reconc
 
     // 7. Structured alert must have been logged
     assert.ok(
-      errors.some((line) => line.includes('DEAD_LETTER') && line.includes(loserBookingId) && line.includes(winnerBookingId)),
+      errors.some((line) => line.includes('DEAD-LETTER') && line.includes(loserBookingId) && line.includes(winnerBookingId)),
       'must log structured alert containing loser and winner bookingIds'
     );
   });

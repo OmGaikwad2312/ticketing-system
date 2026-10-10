@@ -4,14 +4,27 @@ import ReservationPanel from './components/ReservationPanel.jsx';
 import StatusBar from './components/StatusBar.jsx';
 import Toast from './components/Toast.jsx';
 import TopBar from './components/TopBar.jsx';
+import LandingPage from './components/LandingPage.jsx';
 import { useTicketing } from './hooks/useTicketing.js';
+import useTheme from './hooks/useTheme.js';
 
 function App() {
+  const currentPath = window.location.pathname.replace(/\/+$/, '') || '/';
+
+  if (currentPath !== '/booking') {
+    return <LandingPage />;
+  }
+
+  return <BookingPage />;
+}
+
+function BookingPage() {
   const ticketing = useTicketing();
+  const { darkTheme, toggleTheme } = useTheme();
 
   return (
     <main className="page-shell">
-      <TopBar holdCount={ticketing.holds.length} />
+      <TopBar holdCount={ticketing.holds.length} darkTheme={darkTheme} onToggleTheme={toggleTheme} />
       <EventPanel
         counts={ticketing.counts}
         holds={ticketing.holds}
@@ -21,12 +34,13 @@ function App() {
       />
       <div className="content-grid">
         <InventoryPanel
+          busy={ticketing.busy}
           filter={ticketing.filter}
           inventory={ticketing.inventory}
           loading={ticketing.loading}
           onFilterChange={ticketing.setFilter}
           onQueryChange={ticketing.setQuery}
-          onRefresh={() => void ticketing.refreshInventory()}
+          onRefresh={() => void ticketing.refreshInventory({ notify: true })}
           onSelectSeat={ticketing.selectSeat}
           ownHolds={ticketing.ownHolds}
           pendingUnit={ticketing.pendingUnit}

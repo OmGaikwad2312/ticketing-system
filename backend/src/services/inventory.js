@@ -3,6 +3,7 @@
 
 const config = require('../config');
 const { redis } = require('../redis');
+const { enqueueBooking } = require('./persistQueue');
 
 let cachedSeatMap = null;
 let cachedSeatMapAt = 0;
@@ -59,21 +60,28 @@ async function releaseSeat(unit, userId, bookingId = '') {
   return released === 1;
 }
 
-/** Convert a valid hold into a permanent sale and enqueue the booking atomically. */
+/** Confirm atomically, then enqueue persistence without waiting on Postgres or BullMQ. */
 async function confirmSeat(unit, userId, bookingId) {
   const status = await redis.confirm(
     config.soldKey(),
     config.holdKey(unit),
-    config.streamKey,
-    config.userHoldsKey(userId),
-    config.holdMaxKey(unit),
-    config.readyKey(),
+    config.bookingKey(bookingId),
     String(unit),
     userId,
     bookingId,
     config.EVENT_ID,
+    String(config.BOOKING_RECORD_TTL_MS),
   );
-  if (status === 'OK') publish(unit, 'sold');
+  if (status === 'OK') {
+    void redis.multi()
+      .del(config.holdMaxKey(unit))
+      .zrem(config.userHoldsKey(userId), String(unit))
+      .exec()
+      .catch(() => {});
+    publish(unit, 'sold');
+    void enqueueBooking({ bookingId, unit, userId, eventId: config.EVENT_ID })
+      .catch((error) => console.error(`[persist-queue] enqueue failed for ${bookingId}: ${error.message}`));
+  }
   return status;
 }
 

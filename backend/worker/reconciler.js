@@ -62,16 +62,8 @@ async function sweep() {
 
       if (session.status !== 'PAID') continue;
 
-<<<<<<< HEAD
-      const bookingId = keys[i].slice(config.payKey('').length);
-
-      // Guard against malformed sessions (missing metadata)
-      if (!session.user || !session.unit) {
-        console.warn(`${TAG} alert: session ${bookingId} has missing user/unit (${session.user}, ${session.unit}) - skipping blind refund`);
-=======
       if (!session.user || !session.unit) {
         console.error(`${TAG} ALERT: PAID session ${keys[i]} lacks user or unit (${JSON.stringify(session)}); skipping refund`);
->>>>>>> 9f16306674823379e99faedf8df29810c8d319a3
         continue;
       }
 

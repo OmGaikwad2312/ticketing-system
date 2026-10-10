@@ -1,6 +1,5 @@
-// Redis connectivity: the shared main client (normal commands + Lua), a factory for dedicated
-// connections (Pub/Sub subscriber, blocking XREADGROUP readers), Lua script registration via
-// defineCommand, a waitUntilReady helper and a connection-error classifier used to "fail closed" (503).
+// Redis connectivity: the shared main client, BullMQ role-specific connections, Lua registration,
+// readiness waiting, and connection-error classification for fail-closed API responses.
 'use strict';
 
 const fs = require('fs');
@@ -13,7 +12,7 @@ const LUA_DIR = path.join(__dirname, 'lua');
 /** The atomic scripts and how many KEYS each one takes (ioredis sends EVALSHA, falls back to EVAL). */
 const SCRIPTS = {
   hold: { numberOfKeys: 5, lua: fs.readFileSync(path.join(LUA_DIR, 'hold.lua'), 'utf8') },
-  confirm: { numberOfKeys: 6, lua: fs.readFileSync(path.join(LUA_DIR, 'confirm.lua'), 'utf8') },
+  confirm: { numberOfKeys: 3, lua: fs.readFileSync(path.join(LUA_DIR, 'confirm.lua'), 'utf8') },
   release: { numberOfKeys: 3, lua: fs.readFileSync(path.join(LUA_DIR, 'release.lua'), 'utf8') },
   bucket: { numberOfKeys: 1, lua: fs.readFileSync(path.join(LUA_DIR, 'bucket.lua'), 'utf8') },
   pay_begin: { numberOfKeys: 3, lua: fs.readFileSync(path.join(LUA_DIR, 'pay_begin.lua'), 'utf8') },
@@ -67,13 +66,25 @@ function attachLogging(client, label) {
 /**
  * Factory: a NEW connection with the scripts registered and quiet logging attached.
  * Use it for anything that must not share the main connection: Pub/Sub subscribers (a subscribed
- * connection cannot run normal commands) and blocking XREADGROUP loops (a blocked connection
- * would stall every other command queued behind it).
+ * connection cannot run normal commands) and BullMQ producer/worker connections.
  */
 function createRedis(label = 'extra', overrides = {}) {
   const client = new Redis(config.REDIS_URL, { ...BASE_OPTIONS, ...overrides });
   defineScripts(client);
   attachLogging(client, label);
+  return client;
+}
+
+/** Create a dedicated BullMQ connection with role-appropriate retry behavior. */
+function createBullConnection(role) {
+  if (role !== 'worker' && role !== 'producer') {
+    throw new Error(`Unknown BullMQ Redis role: ${role}`);
+  }
+  const options = role === 'worker'
+    ? { maxRetriesPerRequest: null }
+    : BASE_OPTIONS;
+  const client = new Redis(config.REDIS_URL, options);
+  attachLogging(client, `bull-${role}`);
   return client;
 }
 
@@ -111,4 +122,4 @@ function isConnectionError(err) {
 /** The one shared client every API process / worker uses for non-blocking commands and Lua. */
 const redis = createRedis('main');
 
-module.exports = { redis, createRedis, waitUntilReady, isConnectionError };
+module.exports = { redis, createRedis, createBullConnection, waitUntilReady, isConnectionError };

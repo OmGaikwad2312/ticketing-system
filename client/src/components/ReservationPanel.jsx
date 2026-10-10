@@ -15,7 +15,7 @@ function ReservationPanel({
           <p className="eyebrow">YOUR SESSION</p>
           <h2 id="reservation-title">Reservation</h2>
         </div>
-        {holds.length > 0 && <span className="timer-pill">{formatTime(nextExpiry - now)}</span>}
+        {Number.isFinite(nextExpiry) && <span className="timer-pill">{formatTime(nextExpiry - now)}</span>}
       </div>
 
       {holds.length === 0 ? (
@@ -34,17 +34,19 @@ function ReservationPanel({
                   <span className="reservation-seat-icon"><Ticket size={14} /></span>
                   <div>
                     <strong>Unit {hold.unit}</strong>
-                    <small>{hold.phase === 'held' ? 'Held for you' : hold.phase === 'pending' ? 'Payment processing' : 'Checkout ready'}</small>
+                    <small>{hold.phase === 'held' ? 'Held for you' : hold.phase === 'pending' ? 'Payment status pending' : 'Checkout ready'}</small>
                   </div>
                 </div>
-                <span className={`item-time${remaining < 15000 ? ' urgent' : ''}`}>{formatTime(remaining)}</span>
+                <span className={`item-time${hold.phase !== 'pending' && remaining < 15000 ? ' urgent' : ''}`}>
+                  {hold.phase === 'pending' ? '—' : formatTime(remaining)}
+                </span>
                 <button
                   className="remove-button"
-                  disabled={busy !== ''}
+                  disabled={busy !== '' || hold.phase === 'pending'}
                   onClick={() => void onRelease({ unit: hold.unit, state: 'held' })}
                   type="button"
                   aria-label={`Release unit ${hold.unit}`}
-                  title="Release unit"
+                  title={hold.phase === 'pending' ? 'Check payment status before releasing' : 'Release unit'}
                 >
                   <X size={15} />
                 </button>

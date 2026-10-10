@@ -9,8 +9,8 @@ npm run reset && npm run loadtest && npm run verify
 # -> exactly 200 BOOKED, everyone else 409 SOLD, Redis sold = Postgres = 200, PASS
 ```
 
-Stack (as mandated): Node.js 18+ (CommonJS), Express, ioredis, pg, socket.io, dotenv; Redis 7 and
-PostgreSQL 16 in Docker; undici for the load generator. No ORM, no queue broker, no nginx.
+Stack: Node.js 18+ (CommonJS), Express, ioredis, BullMQ, pg, socket.io, dotenv; Redis 7 and
+PostgreSQL 16 in Docker; undici for the load generator. No ORM or nginx.
 
 ---
 
@@ -26,13 +26,12 @@ PostgreSQL 16 in Docker; undici for the load generator. No ORM, no queue broker,
                                        ▼  Lua scripts (atomic)                 Pub/Sub "seat-events"
                                ┌──────────────────┐                             ──▶ Socket.IO clients
                                │     Redis 7      │  holds  (keys with TTL)
-                               │ appendfsync      │  sold   (hash unit→bookingId)
-                               │ always           │  pay:*  (payment sessions)
-                               └────────┬─────────┘  bookings (Stream)
-                                        │ XREADGROUP (consumer group "persisters")
+                                       │ appendfsync      │  sold   (hash unit→bookingId)
+                                       │ always/noeviction│  booking records + BullMQ queue
+                                       └────────┬─────────┘
                            ┌────────────┴────────────┐
                            ▼                         ▼
-                     persist w1                persist w2        at-least-once, idempotent INSERT
+                     persist w1                persist w2        BullMQ retries, idempotent INSERT
                            └────────────┬────────────┘
                                         ▼
                                ┌──────────────────┐
@@ -40,6 +39,7 @@ PostgreSQL 16 in Docker; undici for the load generator. No ORM, no queue broker,
                                └──────────────────┘  dead_letters
                                         ▲
                      rehydrate (startup + every Redis reconnect): sold rows → Redis sold hash
+                     sweeper (every 15 s): missing BullMQ jobs recovered from booking records
                      reconciler (every 30 s): PAID sessions without a seat → REFUND
 ```
 
@@ -57,13 +57,13 @@ race each other. The API processes keep **no state** - kill any of them at any t
 3. **Pay** - a mock gateway (100 ms delay, configurable failure rate). An `HSETNX lock` guarantees a
    double click can never charge twice.
 4. **Confirm** - `confirm.lua`: *not sold yet? caller still owns the hold? → delete the hold, write
-   `sold[unit] = bookingId`, and `XADD` a note to the `bookings` stream*. All or nothing.
+  `sold[unit] = bookingId`, and write a durable `evt:{event}:bk:<bookingId>` record*. All in one
+  atomic Redis operation. The API then enqueues a BullMQ job without waiting for it.
    Confirming the same bookingId twice returns OK (idempotent retries).
-5. **Persist** - two worker processes read the stream through a consumer group and
-   `INSERT ... ON CONFLICT (booking_id) DO NOTHING`. Only after the insert succeeds is the entry
-   `XACK`ed + `XDEL`ed, so a worker crash can only cause a *re-delivery*, never a loss, and the
-   idempotent insert makes re-delivery harmless. Entries stuck on a dead worker are taken over by
-   the other via `XAUTOCLAIM` after 5 s.
+5. **Persist** - two BullMQ workers run concurrently and use
+  `INSERT ... ON CONFLICT (booking_id) DO NOTHING`. BullMQ retries transient failures; the durable
+  Redis booking record and sweeper recover a job even if queue data is lost. A successful insert
+  deletes its booking record. The insert makes retries harmless.
 6. **Final guard** - `UNIQUE (event_id, unit_id)` in Postgres. If every layer above failed and a
    second booking for the same seat ever reached the database, the worker would write it to
    `dead_letters` and shout. It never fires; `verify.js` checks that it never did.
@@ -100,7 +100,7 @@ Nothing else. No global npm packages, no local Redis/Postgres installation.
 
 ```bash
 cd backend
-docker compose up -d        # Redis (appendonly, fsync always) + Postgres (runs db/schema.sql on first start)
+docker compose up -d        # Redis (appendonly, fsync always, noeviction) + Postgres
 npm install
 cp .env.example .env        # Windows: copy .env.example .env   (optional - every value has a default)
 ```
@@ -108,13 +108,16 @@ cp .env.example .env        # Windows: copy .env.example .env   (optional - ever
 `docker compose up -d` returns before Postgres has finished its first initialisation; every script
 below waits for it, so you can chain the commands immediately.
 
+If Redis was already created with another eviction policy, apply the BullMQ setting with
+`docker compose up -d --force-recreate redis`.
+
 ## 4. Run
 
 ```bash
 npm run start:all
 ```
 
-`scripts/start-all.js` launches **api-3001, api-3002, api-3003, persist-w1, persist-w2,
+`scripts/start-all.js` launches **api-3001, api-3002, api-3003, persist-w1, persist-w2, sweeper,
 reconciler** as plain `node` children, prefixes every log line with the process name, restarts a
 child that dies (1 s, then exponential backoff up to 10 s for crash loops) and stops everything on
 Ctrl+C. Works on Linux, macOS and Windows (no shell tricks, no POSIX-only signals).
@@ -138,10 +141,13 @@ curl -s localhost:3002/seats | head -c 200
 ## 5. Test (what the hackathon is judged on)
 
 ```bash
-npm run reset        # 200 free seats, empty tables, empty stream, fresh consumer group
+npm run reset        # 200 free seats, empty tables, and an empty BullMQ queue
 npm run loadtest     # 5000 concurrent users vs 200 seats across the 3 ports
 npm run verify       # cross-checks Redis against Postgres and prints PASS / FAIL
+npm run queue-test   # BullMQ idempotency, recovery, outage, crash, paused-queue, and exhausted-retry regressions
 ```
+
+For a faster Q8 retry-exhaustion check, set `JOB_ATTEMPTS=3` and `JOB_BACKOFF_CAP_MS=250` in `.env` before starting or restarting the API and workers, then run `npm run queue-test`.
 
 Expected with the default `.env` (`PAYMENT_FAIL_RATE=0`):
 
@@ -175,11 +181,27 @@ Throughput:
 
 `race.js` exits 1 if `BOOKED > SEATS` (a double booking); `verify.js` exits 1 unless
 `redisSold == pgCount && duplicates == 0 && deadLetters == 0 && pgCount <= TOTAL_UNITS` (and, as an
-extra check, every `(unit, bookingId)` pair matches between Redis and Postgres).
+extra check, every `(unit, bookingId)` pair matches between Redis and Postgres and BullMQ has no
+waiting, active, delayed, or prioritized jobs).
 
 Knobs: `USERS=10000 SEATS=200 npm run loadtest`, `PORTS=3001,3002 npm run loadtest`,
 `CONNECTIONS=200` (per port). Latency numbers include client-side queueing in the three
 100-connection pools, so they scale with the CPU cores you give the six Node processes.
+
+### Strict tests
+
+`npm run strict:redis` verifies first-command-wins for 200 same-seat Redis Lua contests.
+`npm run strict:fcfs` measures API winner rank and send-time accuracy at 10, 5, 2, 1, and
+0.5 ms spacing. `npm run strict:hot` hammers one seat across the API instances and checks Redis
+and Postgres for exactly one persisted booking per trial. `npm run strict:latency` reports hold
+decision latency and throughput under 5000 users. Each script resets the event before testing and
+warms its keep-alive connections before measurement. `npm run strict:all` runs them in sequence.
+`npm run loadtest` runs the strict suite first and then the existing race test last, so
+`npm run loadtest && npm run verify` still verifies the race test's final state.
+
+First-come-first-served is defined by arrival order at Redis, which executes Lua scripts one at a
+time. Client send timestamps are only a proxy, so the API-level test reports win rates by spacing
+instead of claiming exact ordering at sub-millisecond resolution.
 
 ### The 10 % payment-failure scenario
 
@@ -243,15 +265,19 @@ This path is best-effort and can never fail a booking.
 | What dies                               | What users see                                                                              | How it recovers                                                                                                                                 |
 |-----------------------------------------|---------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------|
 | **One API instance**                    | In-flight requests on that port fail; the other two ports are unaffected                    | start-all restarts it in 1 s; it rehydrates and listens again. A confirm that already ran stays valid - retrying `/pay` returns `BOOKED`.         |
-| **A persist worker**                    | Nothing                                                                                     | Its unacked entries sit in the consumer group's pending list; the other worker reclaims them with `XAUTOCLAIM` after 5 s; start-all restarts it. |
-| **Postgres** (seconds or minutes)       | Nothing - booking only needs Redis. `/health` reports `postgres:"down"` (503)               | Workers log once and wait; the stream buffers every booking; when Postgres is back they drain it in seconds. `verify` converges.                 |
+| **A persist worker**                    | Nothing                                                                                     | BullMQ redelivers stalled jobs to the other worker; start-all restarts the failed worker. |
+| **Postgres** (seconds or minutes)       | Nothing - booking only needs Redis. `/health` reports `postgres:"down"` (503)               | BullMQ retries with exponential backoff capped at 30 s; after retries are exhausted, the sweeper retries failed jobs or re-enqueues missing ones. `verify` converges. |
+| **BullMQ queue data**                   | Booking still returns success                                                                | The atomic booking record remains in Redis; the sweeper finds it after the grace period and re-enqueues the job. |
 | **Redis** (restart)                     | `503 SERVICE_UNAVAILABLE` within milliseconds until it is back (**fail closed**)            | ioredis reconnects (200 ms → 2 s backoff); every `ready` event triggers `rehydrate()`; the AOF (`appendfsync always`) means nothing was lost anyway. |
-| **Redis with data loss**                | `503 {reason:"NOT_READY"}` (`Retry-After: 1`) until rehydration completes                   | `hold.lua` gates on `evt:{e1}:ready`, which `rehydrate()` sets only after restoring all Postgres-persisted sales into `sold` (retrying with exponential backoff on reconnect). Note: confirmed sales still in the Redis stream and not yet persisted to Postgres are lost on a full Redis wipe; use AOF (`appendfsync everysec` or `always`) + a replica + `WAIT` to protect in-flight stream entries. |
+| **Redis with data loss**                | `503 {reason:"NOT_READY"}` (`Retry-After: 1`) until rehydration completes                   | `hold.lua` gates on `evt:{e1}:ready`; Postgres-persisted sales are restored. Use AOF and a replica to protect Redis host loss before persistence. |
 | **API dies between "PAID" and confirm** | The user got no answer                                                                      | The reconciler sweeps `pay:*` every 30 s and marks `PAID` sessions older than 30 s whose seat is not sold to them as `REFUND`.                   |
 | **Hold abandoned**                      | Seat shows `held` until the TTL runs out                                                    | Redis expires the key; the seat is `free` again. No code involved.                                                                             |
 
-Rules that make this work: XACK only after a successful INSERT (at-least-once), idempotent INSERT,
-idempotent confirm, no in-memory state anywhere, `SCAN` instead of `KEYS` everywhere, and a process
+Short retries handle brief outages; the sweeper handles long ones; dead letters are only for permanent conflicts.
+
+Rules that make this work: the booking record is written atomically with the sale, the sweeper
+re-enqueues unpersisted records, inserts and confirmation are idempotent, no in-memory state affects
+booking decisions, `SCAN` instead of `KEYS` for key discovery, and a process
 never crashes because one request failed (async errors are routed to the error handler;
 `unhandledRejection` is logged, not fatal).
 
@@ -291,18 +317,17 @@ TigerBeetle would make the refund/confirm pair atomic).
 | `BUCKET_REFILL_PER_SEC` | `10`                                             | per-user sustained rate                                             |
 | `IP_BUCKET_CAPACITY`    | `15000`                                          | per-IP burst                                                        |
 | `IP_BUCKET_REFILL_PER_SEC` | `5000`                                        | per-IP sustained rate                                               |
-| `WORKER_ID`             | `w1`                                             | consumer name in group `persisters`                                 |
+| `WORKER_ID`             | `w1`                                             | worker name used in persistence logs                                 |
+| `PERSIST_QUEUE_NAME`    | `persist-bookings`                              | BullMQ queue for booking persistence                                 |
+| `BULL_PREFIX`           | `{e1}:bull`                                      | event-tagged BullMQ Redis key prefix                                 |
+| `WORKER_CONCURRENCY`    | `10`                                             | concurrent jobs per persistence worker                              |
+| `JOB_ATTEMPTS`          | `10`                                             | retries for transient persistence errors                            |
+| `JOB_BACKOFF_CAP_MS`    | `30000`                                          | maximum exponential retry delay                                      |
+| `SWEEP_INTERVAL_MS`     | `15000`                                          | durable-record recovery interval                                    |
+| `SWEEP_GRACE_MS`        | `10000`                                          | minimum record age before recovery enqueue                          |
+| `STALLED_INTERVAL_MS`   | `5000`                                           | BullMQ stalled-job detection interval                               |
+| `BOOKING_RECORD_TTL_MS` | `604800000`                                      | Redis booking-record lifetime (7 days)                              |
 | `API_PORTS`             | `3001,3002,3003`                                 | (start-all only) which API instances to launch                      |
-
-### Migration notes
-
-* **Payment session keys (`pay:{EVENT_ID}:<bookingId>`) and bookings stream (`evt:{EVENT_ID}:bookings`):**
-  payment sessions (`pay:{e1}:<bookingId>`) and the confirmed-bookings stream (`evt:{e1}:bookings`)
-  now include the event hash-tag `{EVENT_ID}` so `hold.lua`, `confirm.lua`, `release.lua` and
-  `pay_begin.lua` each operate within a single Redis Cluster slot. `worker/persist.js` creates the
-  consumer group on `evt:{EVENT_ID}:bookings` with `MKSTREAM` and automatically drains any remaining
-  entries from the legacy `bookings` stream. Existing in-flight `pay:<id>` sessions use the old key
-  format; deploy during a quiet window with no pending payments (or read both key forms for one release).
 
 ### If 6379 or 5432 are already in use on your machine
 
@@ -336,17 +361,19 @@ sockets* (rather than pooled connections) at them, raise the per-process file-de
 
 ```
 backend/
-  docker-compose.yml          Redis 7 (AOF, fsync always) + Postgres 16 (+ schema on first start)
+  docker-compose.yml          Redis 7 (AOF, fsync always, noeviction) + Postgres 16
   db/schema.sql               bookings (UNIQUE event_id, unit_id) + dead_letters
   src/
     config.js                 .env parsing, frozen config, Redis key builders
-    redis.js                  ioredis clients, Lua registration (defineCommand), fail-closed options
-    pg.js                     pg.Pool (max 10) + waitForPostgres
+    redis.js                  main/Lua Redis client and BullMQ producer/worker connections
+    pg.js                     API/scripts pg.Pool (max 10) + waitForPostgres
     lua/hold.lua              atomic hold            (commented line by line)
-    lua/confirm.lua           atomic hold -> sold + stream note
+    lua/confirm.lua           atomic hold -> sold + durable booking record
     lua/release.lua           atomic owner-checked release
     lua/bucket.lua            token bucket on Redis's clock
     services/inventory.js     holdSeat / releaseSeat / confirmSeat / getSeatMap + Pub/Sub
+    services/persistQueue.js  BullMQ producer, queue counts, and lifecycle
+    services/deadLetter.js    terminal-job reconciliation and Redis self-heal
     services/payment.js       mock gateway: createSession / pay (HSETNX lock) / settle
     middleware/               identify (x-user-id), validate, rateLimit, errorHandler (+asyncHandler)
     routes/                   health, seats, reserve (/hold /release), pay (/checkout /pay), book (/book)
@@ -354,10 +381,11 @@ backend/
     socket.js                 Socket.IO + dedicated Redis subscriber
     rehydrate.js              Postgres sold rows -> Redis sold hash (HSETNX, idempotent)
     server.js                 startup order, keep-alive tuning, graceful shutdown
-  worker/persist.js           stream consumer: XAUTOCLAIM + XREADGROUP -> INSERT -> XACK/XDEL
+  worker/persist.js           BullMQ persistence workers -> idempotent Postgres INSERT
+  worker/sweeper.js           sold-hash scan and lost-job recovery
   worker/reconciler.js        SCAN pay:* every 30 s, refund PAID-without-seat
   scripts/start-all.js        cross-platform supervisor for the 6 processes
-  scripts/reset.js            wipe event keys / sessions / buckets / stream, truncate tables
+  scripts/reset.js            wipe event keys / sessions / buckets / queue, truncate tables
   loadtest/race.js            5000 users vs 200 seats through undici pools
   loadtest/verify.js          Redis vs Postgres consistency check (PASS / FAIL)
   loadtest/chaos.md           manual failure drills
@@ -382,12 +410,10 @@ only by `rehydrate.js`, `worker/*`, `scripts/*`, `loadtest/verify.js` and `route
   CDN waiting room) that admits users in batches sized to the available inventory. Fairness
   improves, the 429s disappear, and the hot path only ever sees as many users as there are seats
   to fight over.
-* **Horizontal Redis - Redis Cluster.** All keys of an event already share the hash-tag `{e1}`, so
-  `hold.lua` / `confirm.lua` touch a single slot and keep working on a cluster; each event lands on
-  its own shard, which is exactly the partitioning a multi-event platform wants. (Rename the stream
-  to `evt:{e1}:bookings` so `confirm.lua` stays single-slot there.)
+* **Horizontal Redis - Redis Cluster.** Event keys and the BullMQ prefix share the hash-tag `{e1}`;
+  each event lands on its own shard, which is the partitioning a multi-event platform wants.
 * Smaller items: real authentication behind `x-user-id`, an ingress/load balancer with health-aware
-  failover in front of the instances, structured logs + metrics (hold/confirm rates, stream lag,
+  failover in front of the instances, structured logs + metrics (hold/confirm rates, queue lag),
   reconciler refunds), and per-seat-section inventory instead of a single flat range.
 
 ---
@@ -398,8 +424,8 @@ only by `rehydrate.js`, `worker/*`, `scripts/*`, `loadtest/verify.js` and `route
   three `listening on` lines. Postgres down is only a warning there.
 * `[pg] not reachable ... retrying` right after `docker compose up -d` → normal for 5-15 s on the
   very first start while Postgres initialises; everything waits automatically.
-* `npm run reset` while the stack is running is fine: the workers notice the recreated consumer
-  group (`NOGROUP`) and continue.
+* `npm run reset` while the stack is running obliterates current BullMQ jobs; the sweeper recovers
+  any still-unpersisted confirmed bookings from their Redis booking records.
 * Changed `db/schema.sql`? The container only runs it on an empty volume - `npm run reset` applies it
   too (it is idempotent), or `docker compose down -v` for a clean slate.
 * Windows: use PowerShell; `cp` → `copy`, `kill` → `taskkill /PID <pid> /F`; environment variables

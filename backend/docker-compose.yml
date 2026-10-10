@@ -1,11 +1,9 @@
-# Local infrastructure for the reservation engine: Redis 7 with the append-only file fsynced on every
-# write (a confirmed seat survives a Redis crash) and PostgreSQL 16, which runs db/schema.sql on its
-# first start. Only these two run in Docker - the Node processes run on the host (npm run start:all).
+# Local infrastructure: Redis 7 with durable AOF writes and noeviction for BullMQ, plus PostgreSQL 16.
 services:
   redis:
     image: redis:7
     container_name: tickets-redis
-    command: redis-server --appendonly yes --appendfsync always --notify-keyspace-events Ex
+    command: redis-server --appendonly yes --appendfsync always --maxmemory-policy noeviction --notify-keyspace-events Ex
     ports: ["6379:6379"]
     volumes: ["redis-data:/data"]
     restart: unless-stopped

@@ -2,7 +2,9 @@ import { Clock3, Radio, Ticket } from 'lucide-react';
 import { formatTime } from '../lib/presentation.js';
 
 function EventPanel({ counts, holds, inventory, nextExpiry, now }) {
-  const urgent = holds.length > 0 && nextExpiry - now < 15000;
+  const timedHolds = holds.filter((hold) => hold.phase !== 'pending');
+  const urgent = timedHolds.length > 0 && nextExpiry - now < 15000;
+  const hasPendingPayment = holds.some((hold) => hold.phase === 'pending');
 
   return (
     <section className="event-panel" id="top">
@@ -18,10 +20,12 @@ function EventPanel({ counts, holds, inventory, nextExpiry, now }) {
       <div className="hold-clock-panel">
         <div className="clock-topline"><span>YOUR HOLD WINDOW</span><Clock3 size={16} /></div>
         <div className={`clock-value${urgent ? ' urgent' : ''}`}>
-          {holds.length ? formatTime(nextExpiry - now) : '01:30'}
+          {timedHolds.length ? formatTime(nextExpiry - now) : hasPendingPayment ? '—:—' : '01:30'}
         </div>
         <div className="clock-caption">
-          {holds.length ? `${holds.length} ${holds.length === 1 ? 'unit is' : 'units are'} reserved` : '90 seconds once a unit is held'}
+          {timedHolds.length
+            ? `${timedHolds.length} ${timedHolds.length === 1 ? 'unit is' : 'units are'} reserved`
+            : hasPendingPayment ? 'Check the pending payment status' : '90 seconds once a unit is held'}
         </div>
         <div className="event-stats">
           <span><i className="stat-dot free-dot" /> {counts.free} available</span>

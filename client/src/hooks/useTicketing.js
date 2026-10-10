@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
 import { createBookingId, getOrCreateUserId, request, SOCKET_URL, updateSeatMap } from '../api.js';
 import { friendlyError } from '../lib/presentation.js';
@@ -17,14 +17,23 @@ export function useTicketing() {
   const [notice, setNotice] = useState(null);
   const [checkoutStep, setCheckoutStep] = useState(false);
   const [loading, setLoading] = useState(true);
+  const inventoryRequestId = useRef(0);
+  const socketRevision = useRef(0);
 
-  const refreshInventory = async () => {
+  const refreshInventory = async ({ notify = false } = {}) => {
+    const requestId = ++inventoryRequestId.current;
+    const revisionAtStart = socketRevision.current;
     try {
-      setInventory(await request('/seats'));
-      setLoading(false);
+      const result = await request('/seats');
+      if (requestId === inventoryRequestId.current && revisionAtStart === socketRevision.current) {
+        setInventory(result);
+      }
     } catch (error) {
-      setLoading(false);
-      setNotice({ kind: 'error', text: friendlyError(error) });
+      if (requestId === inventoryRequestId.current) {
+        if (notify) setNotice({ kind: 'error', text: friendlyError(error) });
+      }
+    } finally {
+      if (requestId === inventoryRequestId.current) setLoading(false);
     }
   };
 
@@ -47,19 +56,21 @@ export function useTicketing() {
     socket.on('disconnect', () => setSocketConnected(false));
     socket.on('connect_error', () => setSocketConnected(false));
     socket.on('seatmap', (snapshot) => {
+      socketRevision.current += 1;
       setInventory((current) => ({
         event: snapshot.event,
         total: snapshot.total,
         seats: snapshot.seats,
-        counts: current?.counts || { free: 0, held: 0, sold: 0 }
+        counts: snapshot.counts || current?.counts || { free: 0, held: 0, sold: 0 }
       }));
       setLoading(false);
     });
     socket.on('seat', (changedSeat) => {
+      socketRevision.current += 1;
       setInventory((current) => updateSeatMap(current, changedSeat));
     });
     socket.on('seatmap_error', () => {
-      setNotice({ kind: 'error', text: 'Live inventory is temporarily unavailable.' });
+      setNotice((current) => current || { kind: 'error', text: 'Live inventory is temporarily unavailable.' });
     });
 
     const inventoryTimer = window.setInterval(() => void refreshInventory(), 5000);
@@ -76,11 +87,14 @@ export function useTicketing() {
   }, []);
 
   useEffect(() => {
-    const expired = holds.filter((hold) => hold.expiresAt <= now);
+    const expired = holds.filter((hold) => hold.phase !== 'pending' && hold.expiresAt <= now);
     if (expired.length === 0) return;
     const expiredIds = new Set(expired.map((hold) => hold.bookingId));
     setHolds((current) => current.filter((hold) => !expiredIds.has(hold.bookingId)));
-    setCheckoutStep(false);
+    const remainingCheckout = holds.some((hold) => (
+      !expiredIds.has(hold.bookingId) && (hold.phase === 'ready' || hold.phase === 'pending')
+    ));
+    if (!remainingCheckout) setCheckoutStep(false);
     setNotice({
       kind: 'error',
       text: `${expired.length === 1 ? 'A hold has' : `${expired.length} holds have`} expired and returned to inventory.`
@@ -97,7 +111,9 @@ export function useTicketing() {
     return matchesFilter && matchesQuery;
   }), [filter, ownHolds, query, seats]);
   const counts = inventory?.counts || { free: 0, held: 0, sold: 0 };
-  const nextExpiry = holds.reduce((soonest, hold) => Math.min(soonest, hold.expiresAt), Infinity);
+  const nextExpiry = holds
+    .filter((hold) => hold.phase !== 'pending')
+    .reduce((soonest, hold) => Math.min(soonest, hold.expiresAt), Infinity);
   const readyCount = holds.filter((hold) => hold.phase === 'ready' || hold.phase === 'pending').length;
 
   const showError = (error) => setNotice({ kind: 'error', text: friendlyError(error) });
@@ -106,10 +122,12 @@ export function useTicketing() {
     if (ownHolds.has(seat.unit)) {
       setPendingUnit(seat.unit);
       try {
-        await request('/release', { method: 'POST', userId, body: { unit: seat.unit } });
+        const result = await request('/release', { method: 'POST', userId, body: { unit: seat.unit } });
         setHolds((current) => current.filter((hold) => hold.unit !== seat.unit));
         if (holds.length <= 1) setCheckoutStep(false);
-        setNotice({ kind: 'success', text: `Unit ${seat.unit} released.` });
+        setNotice(result.released
+          ? { kind: 'success', text: `Unit ${seat.unit} released.` }
+          : { kind: 'info', text: `Unit ${seat.unit} was no longer held. Seat availability has been refreshed.` });
       } catch (error) {
         showError(error);
       } finally {
@@ -147,27 +165,41 @@ export function useTicketing() {
 
     setBusy('checkout');
     let opened = holds.some((hold) => hold.phase === 'ready' || hold.phase === 'pending');
-    for (const hold of unprepared) {
-      try {
-        await request('/checkout', {
-          method: 'POST',
-          userId,
-          body: { unit: hold.unit, bookingId: hold.bookingId }
-        });
-        opened = true;
-        setHolds((current) => current.map((item) => (
-          item.bookingId === hold.bookingId ? { ...item, phase: 'ready' } : item
-        )));
-      } catch (error) {
-        if (error.payload?.reason === 'NO_HOLD') {
-          setHolds((current) => current.filter((item) => item.bookingId !== hold.bookingId));
+    const openedUnits = [];
+    const failures = [];
+    try {
+      for (const hold of unprepared) {
+        try {
+          await request('/checkout', {
+            method: 'POST',
+            userId,
+            body: { unit: hold.unit, bookingId: hold.bookingId }
+          });
+          opened = true;
+          openedUnits.push(hold.unit);
+          setHolds((current) => current.map((item) => (
+            item.bookingId === hold.bookingId ? { ...item, phase: 'ready' } : item
+          )));
+        } catch (error) {
+          if (['NO_HOLD', 'EXPIRED'].includes(error.payload?.reason)) {
+            setHolds((current) => current.filter((item) => item.bookingId !== hold.bookingId));
+          }
+          failures.push(`Unit ${hold.unit}: ${friendlyError(error)}`);
         }
-        showError(error);
       }
+      setCheckoutStep(opened);
+      if (failures.length > 0) {
+        if (openedUnits.length > 0) failures.unshift(`Checkout ready for units ${openedUnits.join(', ')}.`);
+        setNotice({ kind: 'error', text: failures.join(' ') });
+      } else if (openedUnits.length > 0) {
+        setNotice({ kind: 'success', text: `Checkout ready for units ${openedUnits.join(', ')}.` });
+      }
+    } catch (error) {
+      showError(error);
+    } finally {
+      setBusy('');
+      void refreshInventory();
     }
-    setCheckoutStep(opened);
-    setBusy('');
-    void refreshInventory();
   };
 
   const payAndConfirm = async () => {
@@ -175,32 +207,68 @@ export function useTicketing() {
     if (pendingPayments.length === 0) return;
 
     setBusy('payment');
-    for (const hold of pendingPayments) {
-      try {
-        const result = await request('/pay', {
-          method: 'POST',
-          userId,
-          body: { bookingId: hold.bookingId }
-        });
-        if (result.status === 'BOOKED') {
-          setHolds((current) => current.filter((item) => item.bookingId !== hold.bookingId));
-          setNotice({ kind: 'success', text: `Unit ${result.unit} confirmed.` });
-        } else if (result.status === 'PENDING') {
-          setHolds((current) => current.map((item) => (
-            item.bookingId === hold.bookingId ? { ...item, phase: 'pending' } : item
-          )));
-          setNotice({ kind: 'error', text: `Payment for unit ${hold.unit} is still processing. Check again shortly.` });
+    const confirmedUnits = [];
+    const pendingUnits = [];
+    const failures = [];
+    try {
+      for (const hold of pendingPayments) {
+        setHolds((current) => current.map((item) => (
+          item.bookingId === hold.bookingId ? { ...item, phase: 'pending' } : item
+        )));
+        try {
+          const result = await request('/pay', {
+            method: 'POST',
+            userId,
+            body: { bookingId: hold.bookingId }
+          });
+          if (result.status === 'BOOKED') {
+            confirmedUnits.push(result.unit);
+            setHolds((current) => current.filter((item) => item.bookingId !== hold.bookingId));
+          } else if (result.status === 'PENDING') {
+            pendingUnits.push(hold.unit);
+            setHolds((current) => current.map((item) => (
+              item.bookingId === hold.bookingId ? { ...item, phase: 'pending' } : item
+            )));
+          } else {
+            pendingUnits.push(hold.unit);
+            setHolds((current) => current.map((item) => (
+              item.bookingId === hold.bookingId ? { ...item, phase: 'pending' } : item
+            )));
+            failures.push(`Unit ${hold.unit}: The payment status was unexpected. Check its status before retrying.`);
+          }
+        } catch (error) {
+          const reason = error.payload?.reason;
+          if (['PAYMENT_FAILED', 'EXPIRED', 'SOLD', 'NO_SESSION'].includes(reason)) {
+            setHolds((current) => current.filter((item) => item.bookingId !== hold.bookingId));
+          } else if (error.status === 0 || error.status >= 500) {
+            pendingUnits.push(hold.unit);
+            setHolds((current) => current.map((item) => (
+              item.bookingId === hold.bookingId ? { ...item, phase: 'pending' } : item
+            )));
+            failures.push(`Unit ${hold.unit}: ${friendlyError(error)} Check payment status before retrying.`);
+          } else {
+            failures.push(`Unit ${hold.unit}: ${friendlyError(error)}`);
+            setHolds((current) => current.map((item) => (
+              item.bookingId === hold.bookingId ? { ...item, phase: 'ready' } : item
+            )));
+          }
         }
-      } catch (error) {
-        const reason = error.payload?.reason;
-        if (['PAYMENT_FAILED', 'EXPIRED', 'SOLD', 'NO_SESSION'].includes(reason)) {
-          setHolds((current) => current.filter((item) => item.bookingId !== hold.bookingId));
-        }
-        showError(error);
       }
+
+      const parts = [];
+      if (confirmedUnits.length > 0) parts.push(`Confirmed units ${confirmedUnits.join(', ')}.`);
+      if (pendingUnits.length > 0) parts.push(`Payment status pending for units ${pendingUnits.join(', ')}; check again shortly.`);
+      parts.push(...failures);
+      if (parts.length > 0) {
+        const kind = failures.length > 0 ? 'error' : pendingUnits.length > 0 ? 'info' : 'success';
+        setNotice({ kind, text: parts.join(' ') });
+      }
+    } catch (error) {
+      showError(error);
+    } finally {
+      setBusy('');
+      void refreshInventory();
     }
-    setBusy('');
-    void refreshInventory();
   };
 
   return {
