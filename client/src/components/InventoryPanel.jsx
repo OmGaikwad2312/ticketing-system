@@ -9,7 +9,7 @@ const FILTERS = [
 ];
 
 function InventoryPanel({
-  filter, inventory, loading, onFilterChange, onQueryChange, onRefresh,
+  busy, filter, inventory, loading, onFilterChange, onQueryChange, onRefresh,
   onSelectSeat, ownHolds, pendingUnit, query, seats, visibleSeats
 }) {
   const counts = inventory?.counts || { free: 0, held: 0, sold: 0 };
@@ -75,6 +75,7 @@ function InventoryPanel({
                   seat={seat}
                   owned={ownHolds.has(seat.unit)}
                   pending={pendingUnit === seat.unit}
+                  disabled={busy !== '' || pendingUnit !== null || ownHolds.get(seat.unit)?.phase === 'pending'}
                   onSelect={onSelectSeat}
                 />
               </div>

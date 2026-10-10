@@ -65,6 +65,15 @@ const config = Object.freeze({
   SEATMAP_CACHE_MS: num('SEATMAP_CACHE_MS', 250),
 
   WORKER_ID: str('WORKER_ID', 'w1'),
+  PERSIST_QUEUE_NAME: str('PERSIST_QUEUE_NAME', 'persist-bookings'),
+  BULL_PREFIX: str('BULL_PREFIX', `{${EVENT_ID}}:bull`),
+  WORKER_CONCURRENCY: num('WORKER_CONCURRENCY', 10),
+  JOB_ATTEMPTS: num('JOB_ATTEMPTS', 10),
+  JOB_BACKOFF_CAP_MS: num('JOB_BACKOFF_CAP_MS', 30000),
+  SWEEP_INTERVAL_MS: num('SWEEP_INTERVAL_MS', 15000),
+  SWEEP_GRACE_MS: num('SWEEP_GRACE_MS', 10000),
+  STALLED_INTERVAL_MS: num('STALLED_INTERVAL_MS', 5000),
+  BOOKING_RECORD_TTL_MS: num('BOOKING_RECORD_TTL_MS', 604800000),
 
   // ---- Redis key builders -------------------------------------------------------------------
   // The {EVENT_ID} braces are a Redis Cluster hash-tag: every key of one event hashes to the same
@@ -79,6 +88,8 @@ const config = Object.freeze({
   userHoldsKey: (userId) => `evt:{${EVENT_ID}}:uholds:${userId}`,
   /** Hash of sold seats: field = unit, value = bookingId. */
   soldKey: () => `evt:{${EVENT_ID}}:sold`,
+  /** Durable handoff record created atomically when a seat is sold. */
+  bookingKey: (id) => `evt:{${EVENT_ID}}:bk:${id}`,
   /** Monotonic sequence counter for live seat events. */
   seqKey: () => `evt:{${EVENT_ID}}:seq`,
   /** Mock payment session hash for one bookingId (hash-tagged with {EVENT_ID} for cluster slot co-location). */
@@ -87,12 +98,6 @@ const config = Object.freeze({
   rlKey: (userId) => `rl:${userId}`,
   /** Per-IP token bucket for the rate limiter. */
   ipRlKey: (ip) => `rl:ip:${ip}`,
-  /** Redis Stream that carries confirmed bookings to the persist workers (hash-tagged with {EVENT_ID}). */
-  streamKey: `evt:{${EVENT_ID}}:bookings`,
-  /** Legacy stream key drained during migration. */
-  legacyStreamKey: 'bookings',
-  /** Consumer group name on the stream. */
-  group: 'persisters',
   /** Pub/Sub channel for live seat-state events (consumed by socket.js). */
   channel: 'seat-events',
 });
@@ -109,6 +114,11 @@ if (config.HOLD_TTL_MS < 1 || config.MAX_HOLD_TOTAL_MS < 1 || config.PAY_SESSION
 }
 if (!Number.isInteger(config.MAX_HOLDS_PER_USER) || config.MAX_HOLDS_PER_USER < 1) {
   throw new Error('Config error: MAX_HOLDS_PER_USER must be a positive integer');
+}
+for (const name of ['WORKER_CONCURRENCY', 'JOB_ATTEMPTS', 'JOB_BACKOFF_CAP_MS', 'SWEEP_INTERVAL_MS', 'SWEEP_GRACE_MS', 'STALLED_INTERVAL_MS', 'BOOKING_RECORD_TTL_MS']) {
+  if (!Number.isInteger(config[name]) || config[name] < 1) {
+    throw new Error(`Config error: ${name} must be a positive integer`);
+  }
 }
 if (!['header', 'jwt'].includes(config.AUTH_MODE)) {
   throw new Error('Config error: AUTH_MODE must be "header" or "jwt"');

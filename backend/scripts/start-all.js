@@ -1,5 +1,5 @@
-// Local process supervisor: launches 3 API instances (3001/3002/3003), 2 persist workers (w1/w2)
-// and 1 reconciler as plain `node` child processes, prefixes every log line with [name], restarts a
+// Local process supervisor: launches 3 APIs, 2 BullMQ workers, one sweeper and one reconciler,
+// prefixes every log line with [name], restarts a
 // child that crashes (with backoff) and kills everything on Ctrl+C. Cross-platform (Windows, macOS,
 // Linux): no shell, no signals that Windows lacks - just child_process.spawn(process.execPath).
 'use strict';
@@ -15,6 +15,7 @@ const PROCESSES = [
   ...API_PORTS.map((port) => ({ name: `api-${port}`, script: 'src/server.js', env: { PORT: port } })),
   { name: 'persist-w1', script: 'worker/persist.js', env: { WORKER_ID: 'w1' } },
   { name: 'persist-w2', script: 'worker/persist.js', env: { WORKER_ID: 'w2' } },
+  { name: 'sweeper', script: 'worker/sweeper.js', env: {} },
   { name: 'reconciler', script: 'worker/reconciler.js', env: {} },
 ];
 

@@ -72,65 +72,21 @@ async function createSession(userId, unit, bookingId) {
 }
 
 /**
-<<<<<<< HEAD
- * Charge the mock gateway for a session. Returns { status, user, unit }:
- *   status 'PAID' | 'FAILED'  - decided by this call
- *   status 'PENDING' | 'PAID' | 'FAILED' | 'REFUND' | 'NO_HOLD' - stored / atomic validation result
- *   status 'NO_SESSION' | 'FORBIDDEN'
- */
-async function pay(bookingId, userId) {
-  const session = await getSession(bookingId);
-  if (!session) return { status: 'NO_SESSION' };
-  if (userId && session.user !== userId) return { status: 'FORBIDDEN' };
-
-  const unit = Number(session.unit);
-  const targetUser = userId || session.user;
-
-  // Extend hold and payment TTL to comfortably cover payment gateway delay + buffer
-  const extendHoldMs = Math.max(config.HOLD_TTL_MS, config.PAYMENT_DELAY_MS + 30000);
-  const extendPayMs = Math.max(config.PAY_SESSION_TTL_MS, config.PAYMENT_DELAY_MS + 30000);
-
-  // Atomically check hold ownership, lock session, and extend TTL
-  const beginResult = await redis.begin_payment(
-    config.payKey(bookingId),
-    config.holdKey(unit),
-    targetUser,
-    bookingId,
-    extendHoldMs,
-    extendPayMs,
-  );
-
-  if (beginResult === 'LOCKED') {
-    const current = await getSession(bookingId);
-    return { status: current ? current.status : 'PENDING', user: session.user, unit };
-  }
-  if (beginResult === 'NO_SESSION' || beginResult === 'FORBIDDEN') {
-    return { status: beginResult };
-  }
-  if (beginResult === 'NO_HOLD') {
-    return { status: 'NO_HOLD', user: session.user, unit };
-  }
-  if (beginResult !== 'OK') {
-    // Already in a terminal status: 'PAID' | 'FAILED' | 'REFUND'
-    return { status: beginResult, user: session.user, unit };
-=======
- * Charge the mock gateway for a session. Returns { status, user, unit, decided }:
- *   status 'PAID' | 'FAILED'  - decided by this call (decided: true)
- *   status 'PENDING' | 'PAID' | 'FAILED' | 'REFUND' - stored result when another call already charged (decided: false)
- *   status 'SOLD' | 'EXPIRED' | 'FORBIDDEN' - pre-charge check failed (decided: false, no charge)
- *   status 'NO_SESSION'       - unknown / expired bookingId
+ * Charge a session only after Redis atomically verifies the user, seat hold, and payment lock.
+ * `decided` is true only for the caller that invoked the gateway.
  */
 async function pay(bookingId, callerUserId) {
   const key = config.payKey(bookingId);
   const session = await getSession(bookingId);
   if (!session) return { status: 'NO_SESSION', decided: false };
 
-  const effectiveUser = callerUserId !== undefined ? callerUserId : session.user;
+  const unit = Number(session.unit);
+  const effectiveUser = callerUserId === undefined ? session.user : callerUserId;
   const begin = await redis.pay_begin(
     config.soldKey(),
-    config.holdKey(session.unit),
+    config.holdKey(unit),
     key,
-    String(session.unit),
+    String(unit),
     String(effectiveUser),
     String(config.PAYMENT_TIMEOUT_MS),
     String(config.PAYMENT_TIMEOUT_MS),
@@ -138,81 +94,61 @@ async function pay(bookingId, callerUserId) {
   const code = Array.isArray(begin) ? begin[0] : begin;
 
   if (code === 'NO_SESSION') return { status: 'NO_SESSION', decided: false };
-  if (code === 'FORBIDDEN') return { status: 'FORBIDDEN', user: session.user, unit: session.unit, decided: false };
+  if (code === 'FORBIDDEN') return { status: 'FORBIDDEN', user: session.user, unit, decided: false };
   if (code === 'DUP') {
-    const storedStatus = begin[1] || session.status;
-    return { status: storedStatus, user: session.user, unit: session.unit, decided: false };
->>>>>>> 9f16306674823379e99faedf8df29810c8d319a3
+    return {
+      status: begin[1] || session.status,
+      user: session.user,
+      unit,
+      decided: false,
+    };
   }
-  if (code === 'SOLD') return { status: 'SOLD', user: session.user, unit: session.unit, decided: false };
-  if (code === 'EXPIRED') return { status: 'EXPIRED', user: session.user, unit: session.unit, decided: false };
-
-<<<<<<< HEAD
-  // Simulate the gateway round-trip
-  await sleep(config.PAYMENT_DELAY_MS);
-  const success = Math.random() >= config.PAYMENT_FAIL_RATE;
-
-  if (success) {
-    await redis.finish_payment(
-      config.payKey(bookingId),
-      'PAID',
-      String(Date.now()),
-      config.PAID_SESSION_TTL_MS,
-    );
-    return { status: 'PAID', user: session.user, unit };
+  if (code === 'SOLD' || code === 'EXPIRED') {
+    return { status: code, user: session.user, unit, decided: false };
+  }
+  if (code !== 'GO') {
+    throw new Error(`Unexpected pay_begin result for ${bookingId}: ${JSON.stringify(begin)}`);
   }
 
-  await redis.finish_payment(
-    config.payKey(bookingId),
-    'FAILED',
-    '0',
-    config.PAY_SESSION_TTL_MS,
-  );
-  return { status: 'FAILED', user: session.user, unit };
-=======
-  // code === 'GO': call the gateway ONLY after hold & session ownership were atomically verified.
   const success = await gateway({
     idempotencyKey: bookingId,
     bookingId,
     user: session.user,
-    unit: session.unit,
+    unit,
   });
 
   if (success) {
-    // Keep PAID sessions around for PAID_SESSION_TTL_MS so the reconciler can audit them.
-    const finished = await redis.pay_finish(key, 'PAID', String(config.PAID_SESSION_TTL_MS), String(Date.now()));
+    const finished = await redis.pay_finish(
+      key,
+      'PAID',
+      String(config.PAID_SESSION_TTL_MS),
+      String(Date.now()),
+    );
     if (Number(finished) === 0) {
-      console.error(`[payment] ALERT: session ${bookingId} vanished during payment charge for user=${session.user} unit=${session.unit}; proceeding with confirm`);
+      console.error(`[payment] ALERT: session ${bookingId} vanished during payment charge for user=${session.user} unit=${unit}; proceeding with confirm`);
     }
-    return { status: 'PAID', user: session.user, unit: session.unit, decided: true };
+    return { status: 'PAID', user: session.user, unit, decided: true };
   }
 
   const finished = await redis.pay_finish(key, 'FAILED', String(config.PAY_SESSION_TTL_MS), '');
   if (Number(finished) === 0) {
-    console.error(`[payment] ALERT: session ${bookingId} vanished during failed payment charge for user=${session.user} unit=${session.unit}`);
+    console.error(`[payment] ALERT: session ${bookingId} vanished during failed payment charge for user=${session.user} unit=${unit}`);
   }
-  return { status: 'FAILED', user: session.user, unit: session.unit, decided: true };
->>>>>>> 9f16306674823379e99faedf8df29810c8d319a3
+  return { status: 'FAILED', user: session.user, unit, decided: true };
 }
 
 /**
- * Run the payment for a session and apply the result to the seat inventory.
- * Returns { outcome, unit, bookingId } where outcome is one of:
- *   BOOKED | SOLD | EXPIRED | PAYMENT_FAILED | PENDING | NO_SESSION | FORBIDDEN | NOT_READY
+ * Run payment and apply its result to inventory.
+ * Returns BOOKED, SOLD, EXPIRED, PAYMENT_FAILED, PENDING, NO_SESSION, FORBIDDEN, or NOT_READY.
  */
 async function settle(userId, bookingId) {
   const result = await pay(bookingId, userId);
   if (result.status === 'NO_SESSION') return { outcome: 'NO_SESSION', bookingId };
-<<<<<<< HEAD
-  if (result.status === 'FORBIDDEN') return { outcome: 'FORBIDDEN', bookingId };
-  if (result.status === 'NO_HOLD') return { outcome: 'EXPIRED', unit: result.unit, bookingId };
-=======
-  // Only the user who created the session may settle it (never confirm someone else's seat).
-  if (result.status === 'FORBIDDEN' || result.user !== userId) return { outcome: 'FORBIDDEN', bookingId };
->>>>>>> 9f16306674823379e99faedf8df29810c8d319a3
+  if (result.status === 'FORBIDDEN' || result.user !== userId) {
+    return { outcome: 'FORBIDDEN', bookingId };
+  }
 
   const unit = Number(result.unit);
-
   if (result.status === 'SOLD') return { outcome: 'SOLD', unit, bookingId };
   if (result.status === 'EXPIRED') return { outcome: 'EXPIRED', unit, bookingId };
 
@@ -221,20 +157,12 @@ async function settle(userId, bookingId) {
     if (confirmed === 'OK') return { outcome: 'BOOKED', unit, bookingId };
     if (confirmed === 'NOT_READY') return { outcome: 'NOT_READY', unit, bookingId };
 
-    // Paid but the seat cannot be delivered (hold expired / taken): mark refund
     await setStatus(bookingId, 'REFUND');
     return { outcome: confirmed === 'SOLD' ? 'SOLD' : 'EXPIRED', unit, bookingId };
   }
 
   if (result.status === 'FAILED') {
-<<<<<<< HEAD
-    await releaseSeat(unit, userId, bookingId);
-=======
-    // Give the seat back immediately so other buyers can take it - ONLY when this call decided FAILED.
-    if (result.decided) {
-      await releaseSeat(unit, userId);
-    }
->>>>>>> 9f16306674823379e99faedf8df29810c8d319a3
+    if (result.decided) await releaseSeat(unit, userId);
     return { outcome: 'PAYMENT_FAILED', unit, bookingId };
   }
 

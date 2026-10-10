@@ -1,6 +1,4 @@
-// Reset everything to "200 free seats": deletes the event's Redis keys (holds, sold hash), payment
-// sessions, rate-limit buckets and the bookings stream (SCAN, never KEYS), truncates the Postgres
-// tables, (re)applies db/schema.sql idempotently, recreates the consumer group, and sets ready sentinel.
+// Reset everything to "200 free seats": truncate Postgres, obliterate BullMQ jobs, clear event/payment/rate keys, and rehydrate readiness.
 'use strict';
 
 const fs = require('fs');
@@ -9,6 +7,7 @@ const config = require('../src/config');
 const { redis, waitUntilReady } = require('../src/redis');
 const { pool, waitForPostgres } = require('../src/pg');
 const rehydrate = require('../src/rehydrate');
+const { getQueue, closeQueue } = require('../src/services/persistQueue');
 
 /** Delete every key matching `pattern` using SCAN (safe on a busy Redis). Returns the count. */
 async function scanDelete(pattern) {
@@ -34,26 +33,23 @@ async function main() {
   await pool.query('TRUNCATE bookings, dead_letters RESTART IDENTITY');
   console.log('[reset] truncated bookings and dead_letters (identities restarted)');
 
-  // ---- Redis ----
+  // ---- Queue and Redis ----
+  const queue = await getQueue();
+  await queue.obliterate({ force: true });
+  await closeQueue();
+  const bookingRecordsDeleted = await scanDelete(config.bookingKey('*'));
   const evtDeleted = await scanDelete(`evt:{${config.EVENT_ID}}:*`);
   const payDeleted = await scanDelete(config.payKey('*'));
   const rlDeleted = await scanDelete(config.rlKey('*'));
-  const streamDeleted = await redis.del(config.streamKey);
-  if (config.legacyStreamKey) await redis.del(config.legacyStreamKey);
-  try {
-    await redis.xgroup('CREATE', config.streamKey, config.group, '0', 'MKSTREAM');
-  } catch (err) {
-    // A running persist worker may have recreated the group a millisecond before us - that is fine.
-    if (!String(err.message).includes('BUSYGROUP')) throw err;
-  }
   await rehydrate();
 
   // Set readiness sentinel so immediate requests succeed
   await redis.set(config.readyKey(), '1');
 
   console.log(`[reset] cleared ${evtDeleted} event keys (holds + sold hash) for event ${config.EVENT_ID}`);
+  console.log(`[reset] cleared ${bookingRecordsDeleted} booking records and obliterated BullMQ queue ${config.PERSIST_QUEUE_NAME}`);
   console.log(`[reset] cleared ${payDeleted} payment sessions, ${rlDeleted} rate-limit buckets`);
-  console.log(`[reset] ${streamDeleted ? 'deleted' : 'no'} "${config.streamKey}" stream; consumer group "${config.group}" ready; ready sentinel set`);
+  console.log('[reset] ready sentinel set');
   console.log(`[reset] done - ${config.TOTAL_UNITS} seats free`);
 }
 

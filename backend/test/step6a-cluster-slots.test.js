@@ -6,34 +6,29 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { config, redis, pool, cleanRedis } = require('./helpers');
-
+const { getCounts } = require('../src/services/persistQueue');
 const calcSlot = require('cluster-key-slot');
 
-// Standard Redis Cluster CRC16 (XMODEM) slot calculation
-function crc16(buf) {
+function crc16(buffer) {
   let crc = 0;
-  for (let i = 0; i < buf.length; i++) {
-    crc ^= buf[i] << 8;
-    for (let j = 0; j < 8; j++) {
+  for (let index = 0; index < buffer.length; index += 1) {
+    crc ^= buffer[index] << 8;
+    for (let bit = 0; bit < 8; bit += 1) {
       crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) & 0xffff : (crc << 1) & 0xffff;
     }
   }
   return crc;
 }
 
-function clusterKeySlot(key) {
-  const s = String(key);
-  const open = s.indexOf('{');
-  if (open !== -1) {
-    const close = s.indexOf('}', open + 1);
-    if (close !== -1 && close > open + 1) {
-      return crc16(Buffer.from(s.slice(open + 1, close))) % 16384;
-    }
-  }
-  return crc16(Buffer.from(s)) % 16384;
+function manualSlot(key) {
+  const value = String(key);
+  const open = value.indexOf('{');
+  const close = value.indexOf('}', open + 1);
+  const tagged = open !== -1 && close > open + 1 ? value.slice(open + 1, close) : value;
+  return crc16(Buffer.from(tagged)) % 16384;
 }
 
-describe('Step 6a: Redis Cluster hash-tag slot alignment and stream migration', () => {
+describe('Step 6a: Redis Cluster hash-tag alignment and BullMQ persistence', () => {
   before(async () => {
     const schema = fs.readFileSync(path.join(__dirname, '..', 'db', 'schema.sql'), 'utf8');
     await pool.query(schema);
@@ -48,69 +43,28 @@ describe('Step 6a: Redis Cluster hash-tag slot alignment and stream migration', 
     await pool.query('DELETE FROM bookings WHERE event_id = $1', [config.EVENT_ID]).catch(() => {});
   });
 
-  it('hashes every key used together in hold.lua, confirm.lua, release.lua, and pay_begin.lua to one CRC16 slot', async () => {
-    assert.equal(config.streamKey, `evt:{${config.EVENT_ID}}:bookings`);
-
-    const holdKeys = [
+  it('keeps Lua keys, booking records, and BullMQ keys in the event hash slot', () => {
+    const bookingId = crypto.randomUUID();
+    const keys = [
       config.soldKey(),
       config.holdKey(7),
       config.readyKey(),
       config.userHoldsKey('alice'),
       config.holdMaxKey(7),
+      config.bookingKey(bookingId),
+      config.payKey(bookingId),
+      config.BULL_PREFIX,
     ];
-    const confirmKeys = [
-      config.soldKey(),
-      config.holdKey(7),
-      config.streamKey,
-      config.userHoldsKey('alice'),
-      config.holdMaxKey(7),
-    ];
-    const releaseKeys = [
-      config.holdKey(7),
-      config.userHoldsKey('alice'),
-      config.holdMaxKey(7),
-    ];
-    const payBeginKeys = [
-      config.soldKey(),
-      config.holdKey(7),
-      config.payKey(crypto.randomUUID()),
-    ];
-
-    const expectedSlot = calcSlot(config.soldKey());
-    assert.equal(clusterKeySlot(config.soldKey()), expectedSlot);
-
-    for (const [scriptName, keys] of [
-      ['hold.lua', holdKeys],
-      ['confirm.lua', confirmKeys],
-      ['release.lua', releaseKeys],
-      ['pay_begin.lua', payBeginKeys],
-    ]) {
-      for (const k of keys) {
-        const slot = calcSlot(k);
-        const manualSlot = clusterKeySlot(k);
-        assert.equal(slot, expectedSlot, `${scriptName} key "${k}" slot ${slot} !== ${expectedSlot}`);
-        assert.equal(manualSlot, expectedSlot, `${scriptName} manual CRC16 "${k}" ${manualSlot} !== ${expectedSlot}`);
-      }
+    const expected = calcSlot(config.soldKey());
+    for (const key of keys) {
+      assert.equal(calcSlot(key), expected, `${key} must share the event slot`);
+      assert.equal(manualSlot(key), expected, `${key} manual slot must share the event slot`);
     }
   });
 
-  it('persist worker creates consumer group on evt:{EVENT_ID}:bookings and drains legacy "bookings" stream', async () => {
-    const persist = require('../worker/persist');
-    assert.equal(typeof persist.ensureGroup, 'function');
-    assert.equal(typeof persist.drainLegacyStream, 'function');
-
-    await persist.ensureGroup();
-
-    // Add an entry to legacy "bookings" stream and verify drainLegacyStream persists it to Postgres
-    const legacyBookingId = crypto.randomUUID();
-    await redis.xadd('bookings', '*', 'unit', '88', 'user', 'legacy-user', 'bookingId', legacyBookingId, 'event', config.EVENT_ID);
-
-    const drained = await persist.drainLegacyStream();
-    assert.equal(drained, 1);
-
-    const { rows } = await pool.query('SELECT booking_id, unit_id, user_id FROM bookings WHERE booking_id = $1', [legacyBookingId]);
-    assert.equal(rows.length, 1);
-    assert.equal(rows[0].unit_id, 88);
-    assert.equal(rows[0].user_id, 'legacy-user');
+  it('provides BullMQ queue counts without a custom booking stream', async () => {
+    const counts = await getCounts();
+    assert.equal(Number(counts.waiting || 0), 0);
+    assert.equal(await redis.exists(config.bookingKey('missing')), 0);
   });
 });

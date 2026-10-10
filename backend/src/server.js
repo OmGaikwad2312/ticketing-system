@@ -10,6 +10,7 @@ const { redis, waitUntilReady } = require('./redis');
 const { pool, waitForPostgres } = require('./pg');
 const rehydrate = require('./rehydrate');
 const { attachSocket } = require('./socket');
+const { closeQueue } = require('./services/persistQueue');
 
 const TAG = `[api-${config.PORT}]`;
 
@@ -54,6 +55,7 @@ async function main() {
       await new Promise((resolve) => server.close(() => resolve()));
       if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
       await socket.close();
+      await closeQueue();
       await redis.quit().catch(() => redis.disconnect());
       await pool.end().catch(() => {});
     } catch (err) {

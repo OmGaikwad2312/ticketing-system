@@ -1,6 +1,6 @@
-import { Ticket } from 'lucide-react';
+import { Moon, Sun, Ticket } from 'lucide-react';
 
-function TopBar({ holdCount }) {
+function TopBar({ holdCount, darkTheme, onToggleTheme }) {
   return (
     <header className="topbar">
       <a className="wordmark" href="#top" aria-label="Ticketing home">
@@ -14,6 +14,15 @@ function TopBar({ holdCount }) {
       <div className="topbar-meta">
         <span className="live-caption"><span className="live-dot" /> LIVE INVENTORY</span>
         <span className="guest-chip">Guest checkout</span>
+        <button
+          className="theme-toggle"
+          type="button"
+          onClick={onToggleTheme}
+          aria-label={`Switch to ${darkTheme ? 'light' : 'dark'} theme`}
+          title={`Switch to ${darkTheme ? 'light' : 'dark'} theme`}
+        >
+          {darkTheme ? <Sun size={15} /> : <Moon size={15} />}
+        </button>
       </div>
     </header>
   );

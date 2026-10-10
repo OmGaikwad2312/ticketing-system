@@ -1,274 +1,108 @@
-// Persist worker: moves confirmed bookings from the Redis Stream "bookings" into Postgres.
-// Runs as a member of the "persisters" consumer group (start-all launches w1 and w2). Delivery is
-// at-least-once (XACK only after a successful INSERT) and the INSERT is idempotent
-// (ON CONFLICT (booking_id) DO NOTHING), so crashes and retries can never duplicate a row.
+// BullMQ worker: persist confirmed Redis booking records into Postgres with retryable, idempotent inserts.
 'use strict';
 
+const { Worker, UnrecoverableError } = require('bullmq');
+const { Pool } = require('pg');
 const config = require('../src/config');
-const { redis, createRedis, waitUntilReady, isConnectionError } = require('../src/redis');
-const { pool, waitForPostgres, describeError } = require('../src/pg');
+const { redis, createBullConnection, waitUntilReady } = require('../src/redis');
+const { deadLetter } = require('../src/services/deadLetter');
 
-const { streamKey: STREAM, legacyStreamKey: LEGACY_STREAM = 'bookings', group: GROUP, WORKER_ID } = config;
-const TAG = `[persist-${WORKER_ID}]`;
-const BATCH = 50;
-const CLAIM_IDLE_MS = 5000;   // entries pending longer than this on ANY consumer get reclaimed
-const BLOCK_MS = 2000;        // how long XREADGROUP waits for new entries
-const RETRY_SLEEP_MS = 1000;  // pause when Postgres / Redis is unavailable
-
-// Blocking reads need their own connection: a blocked connection cannot serve other commands.
-let blocking = null;
-
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const TAG = `[persist-${config.WORKER_ID}]`;
+const pool = new Pool({
+  connectionString: config.DATABASE_URL,
+  max: 20,
+  connectionTimeoutMillis: 3000,
+  idleTimeoutMillis: 30000,
+  query_timeout: 10000,
+});
+let worker = null;
 let stopping = false;
 
-/** Create the consumer group if it does not exist yet (BUSYGROUP = already there, fine). */
-async function ensureGroup(stream = STREAM, mkstream = true) {
-  try {
-    const args = ['CREATE', stream, GROUP, '0'];
-    if (mkstream) args.push('MKSTREAM');
-    await redis.xgroup(...args);
-    console.log(`${TAG} created consumer group ${GROUP} on stream ${stream}`);
-  } catch (err) {
-    if (!String(err.message).includes('BUSYGROUP')) throw err;
-  }
-}
+pool.on('error', (error) => console.error(`${TAG} postgres pool error: ${error.message}`));
 
-/** Convert a stream entry's flat [field, value, field, value, ...] array into an object. */
-function fieldsToObject(fields) {
-  const obj = {};
-  for (let i = 0; i < fields.length; i += 2) obj[fields[i]] = fields[i + 1];
-  return obj;
-}
-
-/** Acknowledge and delete a fully handled entry (one round-trip). */
-async function ackAndDelete(id, stream = STREAM) {
-  await redis.multi().xack(stream, GROUP, id).xdel(stream, id).exec();
-}
-
-/**
- * Postgres SQLSTATE classes 22 (data exception) and 23 (integrity constraint) mean the row itself is
- * unacceptable and retrying can never help -> dead-letter it. Everything else (connection refused,
- * admin shutdown, timeouts, ...) is treated as transient -> keep the entry pending and retry later.
- */
-function isPoisonError(err) {
-  const code = String(err.code || '');
-  return code.startsWith('22') || code.startsWith('23');
-}
-
-/** Signals "Postgres is not usable right now"; the main loop then waits for it to come back. */
-class PostgresUnavailable extends Error {
-  constructor(cause) {
-    super(describeError(cause));
-    this.name = 'PostgresUnavailable';
-  }
-}
-
-/**
- * Phase 1 of one entry: write it to Postgres (or to dead_letters if it can never be inserted).
- * Throws PostgresUnavailable on transient failures - nothing has been acked at that point.
- */
-async function writeToPostgres(id, note) {
+async function processBooking(job) {
+  const { bookingId, unit, userId, eventId } = job.data;
   try {
     await pool.query(
       `INSERT INTO bookings (booking_id, event_id, unit_id, user_id)
        VALUES ($1, $2, $3, $4)
        ON CONFLICT (booking_id) DO NOTHING`,
-      [note.bookingId, note.event, Number(note.unit), note.user],
+      [bookingId, eventId, Number(unit), userId],
     );
-    return 'persisted';
-  } catch (err) {
-    if (!isPoisonError(err)) throw new PostgresUnavailable(err);
-
-    // A DIFFERENT bookingId already owns (event_id, unit_id) - or the payload is malformed.
-    // This must never happen (Lua + the sold hash prevent it); it is a safety net, so shout.
-    const reason = err.code === '23505'
-      ? `unique violation on ${err.constraint || 'bookings'}: seat already sold to another booking`
-      : `${err.code}: ${err.message}`;
-
-    let dlId = null;
-    try {
-      const ins = await pool.query(
-        "INSERT INTO dead_letters (payload, reason, status) VALUES ($1, $2, 'PENDING') RETURNING id",
-        [JSON.stringify({ streamId: id, ...note }), reason],
-      );
-      dlId = ins.rows[0] && ins.rows[0].id;
-    } catch (dlErr) {
-      throw new PostgresUnavailable(dlErr); // could not record it now -> entry stays pending
+  } catch (error) {
+    if (error.code === '23505' && error.constraint !== 'bookings_booking_id_key') {
+      throw new UnrecoverableError('SEAT_CONFLICT');
     }
-
-    let winnerBookingId = null;
-    try {
-      if (note.event && note.unit !== undefined) {
-        const winRes = await pool.query(
-          'SELECT booking_id FROM bookings WHERE event_id = $1 AND unit_id = $2',
-          [note.event, Number(note.unit)],
-        );
-        if (winRes.rows.length > 0) {
-          winnerBookingId = winRes.rows[0].booking_id;
-          await redis.hset(config.soldKey(), String(note.unit), String(winnerBookingId));
-        }
-      }
-      if (note.bookingId) {
-        await redis.pay_finish(
-          config.payKey(note.bookingId),
-          'REFUND',
-          String(config.PAID_SESSION_TTL_MS),
-          '',
-        );
-      }
-      if (dlId !== null) {
-        await pool.query(
-          "UPDATE dead_letters SET status = 'RESOLVED', resolved_at = now() WHERE id = $1",
-          [dlId],
-        );
-      }
-    } catch (reconcileErr) {
-      console.error(`${TAG} failed to reconcile dead-letter ${id}: ${reconcileErr.message}`);
-    }
-
-    console.error(
-      `${TAG} !!! DEAD LETTER ${id} ` +
-      JSON.stringify({
-        alert: 'DEAD_LETTER_RECONCILED',
-        streamId: id,
-        deadLetterId: dlId,
-        reason,
-        event: note.event,
-        unit: Number(note.unit),
-        loserBookingId: note.bookingId,
-        loserUser: note.user,
-        winnerBookingId,
-      }),
-    );
-    return 'dead-lettered';
+    throw error;
   }
+
+  await redis.del(config.bookingKey(bookingId)).catch((error) => {
+    console.error(`${TAG} persisted ${bookingId}, but booking-record cleanup failed: ${error.message}`);
+  });
+  console.log(`persisted ${bookingId} unit ${unit} by ${config.WORKER_ID}`);
+  return { bookingId, unit };
 }
 
-/** Handle ONE stream entry: Postgres first, then XACK + XDEL (Redis errors propagate to the loop). */
-async function processEntry(id, fields, stream = STREAM) {
-  const note = fieldsToObject(fields);
-  const result = await writeToPostgres(id, note);
-  await ackAndDelete(id, stream);
-  if (result === 'persisted') console.log(`persisted ${note.bookingId} unit ${note.unit} by ${WORKER_ID}`);
-}
+async function startWorker() {
+  await waitUntilReady(redis);
+  worker = new Worker(config.PERSIST_QUEUE_NAME, processBooking, {
+    connection: createBullConnection('worker'),
+    prefix: config.BULL_PREFIX,
+    concurrency: config.WORKER_CONCURRENCY,
+    stalledInterval: config.STALLED_INTERVAL_MS,
+    maxStalledCount: 5,
+    settings: {
+      backoffStrategy: (attemptsMade) => Math.min(1000 * 2 ** (attemptsMade - 1), config.JOB_BACKOFF_CAP_MS),
+    },
+  });
 
-/** Process a list of [id, fields] entries in order; stops at the first transient failure. */
-async function processEntries(entries, stream = STREAM) {
-  for (const [id, fields] of entries) {
-    if (stopping) return;
-    await processEntry(id, fields, stream);
-  }
-}
-
-/** Drain any entries remaining in the legacy "bookings" stream from before the hash-tag migration. */
-async function drainLegacyStream() {
-  if (!LEGACY_STREAM || LEGACY_STREAM === STREAM) return 0;
-  const exists = await redis.exists(LEGACY_STREAM);
-  if (!exists) return 0;
-  await ensureGroup(LEGACY_STREAM, false);
-  let drained = 0;
-  for (;;) {
-    const claimed = await redis.xautoclaim(LEGACY_STREAM, GROUP, WORKER_ID, 0, '0', 'COUNT', BATCH);
-    const claimedEntries = claimed && claimed[1] ? claimed[1] : [];
-    if (claimedEntries.length) {
-      await processEntries(claimedEntries, LEGACY_STREAM);
-      drained += claimedEntries.length;
-      continue;
+  worker.on('error', (error) => console.error(`${TAG} worker error: ${error.message}`));
+  worker.on('stalled', (jobId) => console.warn(`${TAG} job ${jobId} stalled and will be retried`));
+  worker.on('failed', async (job, error) => {
+    if (!job) return;
+    if (error instanceof UnrecoverableError) {
+      try {
+        await deadLetter(job, error, pool);
+      } catch (deadLetterError) {
+        console.error(`${TAG} unable to dead-letter ${job.id}: ${deadLetterError.message}`);
+      }
+      return;
     }
-    const res = await redis.xreadgroup('GROUP', GROUP, WORKER_ID, 'COUNT', BATCH, 'STREAMS', LEGACY_STREAM, '>');
-    const entries = res && res[0] && res[0][1] ? res[0][1] : [];
-    if (!entries.length) break;
-    await processEntries(entries, LEGACY_STREAM);
-    drained += entries.length;
-  }
-  const rem = await redis.xlen(LEGACY_STREAM);
-  if (rem === 0) await redis.del(LEGACY_STREAM);
-  return drained;
-}
-
-async function loop() {
-  let lastErrorMessage = null;
-  while (!stopping) {
-    try {
-      await drainLegacyStream();
-      // a) Reclaim entries that another (dead or slow) consumer left pending for > CLAIM_IDLE_MS.
-      //    Redis 7 returns [nextCursor, entries, deletedIds]; we only need the entries.
-      const claimed = await redis.xautoclaim(STREAM, GROUP, WORKER_ID, CLAIM_IDLE_MS, '0', 'COUNT', BATCH);
-      const claimedEntries = claimed && claimed[1] ? claimed[1] : [];
-      if (claimedEntries.length) {
-        console.log(`${TAG} reclaimed ${claimedEntries.length} pending entr${claimedEntries.length === 1 ? 'y' : 'ies'}`);
-        await processEntries(claimedEntries);
-      }
-      if (stopping) break;
-
-      // b) Wait for brand-new entries (">" = never delivered to anyone in this group).
-      const res = await blocking.xreadgroup(
-        'GROUP', GROUP, WORKER_ID, 'COUNT', BATCH, 'BLOCK', BLOCK_MS, 'STREAMS', STREAM, '>',
-      );
-      if (res) {
-        for (const [, entries] of res) await processEntries(entries);
-      }
-      lastErrorMessage = null;
-    } catch (err) {
-      if (stopping) break;
-      if (err instanceof PostgresUnavailable) {
-        // Nothing was acked: the entries stay pending and are reclaimed once Postgres is back.
-        console.error(`${TAG} postgres unavailable (${err.message}) - entries stay pending, waiting...`);
-        await waitForPostgres({ retryMs: RETRY_SLEEP_MS });
-        if (!stopping) console.log(`${TAG} postgres is back - resuming`);
-      } else if (String(err.message).includes('NOGROUP')) {
-        // `npm run reset` deleted the stream under us: recreate the group and carry on.
-        await ensureGroup().catch(() => {});
-        await sleep(RETRY_SLEEP_MS);
-      } else {
-        // Log each distinct problem once, not once per second.
-        const text = describeError(err);
-        if (text !== lastErrorMessage) {
-          lastErrorMessage = text;
-          const kind = isConnectionError(err) ? 'redis unavailable' : 'error';
-          console.error(`${TAG} ${kind}: ${text} - retrying every ${RETRY_SLEEP_MS} ms`);
-        }
-        await sleep(RETRY_SLEEP_MS);
-      }
+    const attempts = job.opts.attempts || config.JOB_ATTEMPTS;
+    if (job.attemptsMade >= attempts) {
+      console.warn(`persist job ${job.data.bookingId} exhausted retries, left for the sweeper`);
     }
-  }
+  });
+
+  await worker.waitUntilReady();
+  console.log(`${TAG} consuming BullMQ queue ${config.PERSIST_QUEUE_NAME} (concurrency=${config.WORKER_CONCURRENCY})`);
 }
 
 async function shutdown(signal) {
   if (stopping) return;
   stopping = true;
-  console.log(`${TAG} ${signal} received, finishing current batch...`);
-  const force = setTimeout(() => process.exit(0), BLOCK_MS + 3000).unref();
-  // The blocking XREADGROUP returns within BLOCK_MS; disconnecting it makes that immediate.
-  if (blocking) blocking.disconnect();
-  await redis.quit().catch(() => redis.disconnect());
-  await pool.end().catch(() => {});
-  clearTimeout(force);
+  console.log(`${TAG} ${signal} received, draining active jobs...`);
+  try {
+    if (worker) await worker.close();
+    await redis.quit().catch(() => redis.disconnect());
+    await pool.end();
+  } catch (error) {
+    console.error(`${TAG} shutdown error: ${error.message}`);
+  }
   process.exit(0);
 }
 
-async function main() {
-  console.log(`${TAG} starting (stream=${STREAM}, group=${GROUP})`);
-  blocking = createRedis(`persist-${WORKER_ID}-blocking`);
-  await waitUntilReady(redis);
-  await waitUntilReady(blocking);
-  await ensureGroup();
-  await drainLegacyStream();
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('SIGINT', () => shutdown('SIGINT'));
-  console.log(`${TAG} consuming`);
-  await loop();
-}
-
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));
 process.on('unhandledRejection', (reason) => {
   console.error(`${TAG} unhandled rejection:`, reason && reason.stack ? reason.stack : reason);
 });
 
 if (require.main === module) {
-  main().catch((err) => {
-    console.error(`${TAG} fatal: ${err.stack || err.message}`);
+  startWorker().catch((error) => {
+    console.error(`${TAG} fatal: ${error.stack || error.message}`);
     process.exit(1);
   });
 }
 
-module.exports = { ensureGroup, drainLegacyStream, processEntry, processEntries, writeToPostgres };
+module.exports = { processBooking, startWorker };

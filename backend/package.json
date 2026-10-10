@@ -12,16 +12,24 @@
     "infra:down": "docker compose down",
     "start:api": "node src/server.js",
     "start:worker": "node worker/persist.js",
+    "start:sweeper": "node worker/sweeper.js",
     "start:reconciler": "node worker/reconciler.js",
     "start:all": "node scripts/start-all.js",
     "reset": "node scripts/reset.js",
-    "loadtest": "node loadtest/race.js",
+    "loadtest": "npm run strict:all && node loadtest/race.js",
+    "strict:redis": "node loadtest/strict/fcfs-redis.js",
+    "strict:fcfs": "node loadtest/strict/fcfs-api.js",
+    "strict:hot": "node loadtest/strict/hot-seat.js",
+    "strict:latency": "node loadtest/strict/hold-latency.js",
+    "strict:all": "npm run strict:redis && npm run strict:fcfs && npm run strict:hot && npm run strict:latency",
     "verify": "node loadtest/verify.js",
-    "test": "node --test test/"
+    "test": "node --test test/",
+    "queue-test": "node loadtest/queue-regression.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
     "express": "^4.21.2",
+    "bullmq": "^6.3.12",
     "ioredis": "^5.4.1",
     "pg": "^8.13.1",
     "socket.io": "^4.8.1"
